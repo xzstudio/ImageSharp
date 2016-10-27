@@ -18,6 +18,9 @@ namespace ImageProcessorCore.Tests
             public static string Pd => folder + "pd.png";
             public static string Blur => folder + "blur.png";
             public static string Indexed => folder + "indexed.png";
+
+            public static string Interlaced => folder + "interlaced.png";
+
             public static string Splash => folder + "splash.png";
         }
 
