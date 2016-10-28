@@ -21,6 +21,14 @@ namespace ImageProcessorCore.Formats
         /// </summary>
         private static readonly Dictionary<int, byte[]> ColorTypes = new Dictionary<int, byte[]>();
 
+        private static int[] interlaceColumnFrequency = { 8, 8, 4, 4, 2, 2, 1 };
+
+        private static int[] interlaceColumnOffset = { 0, 4, 0, 2, 0, 1, 0 };
+
+        private static int[] interlaceRowFrequency = { 8, 8, 8, 4, 4, 2, 2 };
+
+        private static int[] interlaceRowOffset = { 0, 0, 4, 0, 2, 0, 1 };
+
         /// <summary>
         /// The stream to decode from.
         /// </summary>
@@ -302,7 +310,15 @@ namespace ImageProcessorCore.Formats
                     decompressedStream.Flush();
 
                     byte[] decompressedBytes = decompressedStream.ToArray();
-                    this.DecodePixelData<TColor, TPacked>(decompressedBytes, pixels);
+
+                    if (this.header.InterlaceMethod == 1)
+                    {
+                        this.DecodeInterlacedPixelData<TColor, TPacked>(decompressedBytes, pixels);
+                    }
+                    else
+                    {
+                        this.DecodePixelData<TColor, TPacked>(decompressedBytes, pixels);
+                    }
                 }
             }
         }
@@ -318,22 +334,84 @@ namespace ImageProcessorCore.Formats
             where TColor : struct, IPackedVector<TPacked>
             where TPacked : struct
         {
-            // TODO: This needs rewriting to use pointers.
-            byte[] defilteredPixelData = new byte[this.bytesPerScanline * this.header.Height];
-            for (int i = 1; i <= this.passes; i++)
+            byte[] previousScanline = new byte[this.bytesPerScanline];
+
+            for (int y = 0; y < this.header.Height; y++)
             {
-                // Variable scanline length per pass.
-                if (this.header.InterlaceMethod != 0)
+                byte[] scanline = new byte[this.bytesPerScanline];
+                Array.Copy(pixelData, y * this.bytesPerScanline, scanline, 0, this.bytesPerScanline);
+                FilterType filterType = (FilterType)scanline[0];
+                byte[] defilteredScanline;
+
+                switch (filterType)
                 {
-                    this.bytesPerScanline = this.CalculateInterlacedScanlineLength(i) + 1;
+                    case FilterType.None:
+
+                        defilteredScanline = NoneFilter.Decode(scanline);
+
+                        break;
+
+                    case FilterType.Sub:
+
+                        defilteredScanline = SubFilter.Decode(scanline, this.bytesPerPixel);
+
+                        break;
+
+                    case FilterType.Up:
+
+                        defilteredScanline = UpFilter.Decode(scanline, previousScanline);
+
+                        break;
+
+                    case FilterType.Average:
+
+                        defilteredScanline = AverageFilter.Decode(scanline, previousScanline, this.bytesPerPixel);
+
+                        break;
+
+                    case FilterType.Paeth:
+
+                        defilteredScanline = PaethFilter.Decode(scanline, previousScanline, this.bytesPerPixel);
+
+                        break;
+
+                    default:
+                        throw new ImageFormatException("Unknown filter type.");
                 }
 
-                byte[] previousScanline = new byte[this.bytesPerScanline];
+                previousScanline = defilteredScanline;
+                this.ProcessDefilteredScanline<TColor, TPacked>(defilteredScanline, y, pixels);
+            }
+        }
 
-                for (int y = 0; y < this.header.Height; y++)
+        /// <summary>
+        /// Decodes the raw pixel data row by row
+        /// </summary>
+        /// <typeparam name="TColor">The pixel format.</typeparam>
+        /// <typeparam name="TPacked">The packed format. <example>uint, long, float.</example></typeparam>
+        /// <param name="pixelData">The pixel data.</param>
+        /// <param name="pixels">The image pixels.</param>
+        private void DecodeInterlacedPixelData<TColor, TPacked>(byte[] pixelData, TColor[] pixels)
+            where TColor : struct, IPackedVector<TPacked>
+            where TPacked : struct
+        {
+            // TODO: This needs rewriting to use pointers.
+            byte[] deinterlacedPixelData = new byte[this.bytesPerScanline * this.header.Height];
+            int subImageOffset = 0;
+            int sampleSize = this.bytesPerPixel; // Math.Max(1, this.header.BitDepth / 8D);
+
+            for (int i = 0; i < 7; i++)
+            {
+                int subImageRows = this.header.Height / interlaceRowFrequency[i];
+                int subImageColumns = this.header.Width / interlaceColumnFrequency[i];
+                int rowLength = (int)Math.Ceiling(subImageColumns * this.header.BitDepth / 8D) + 1;
+                byte[] previousScanline = new byte[rowLength];
+                int offset = 0;
+                for (int y = 0; y < subImageRows; y++)
                 {
-                    byte[] scanline = new byte[this.bytesPerScanline];
-                    Array.Copy(pixelData, y * this.bytesPerScanline, scanline, 0, this.bytesPerScanline);
+                    byte[] scanline = new byte[rowLength];
+                    offset = subImageOffset + (y * rowLength);
+                    Array.Copy(pixelData, offset, scanline, 0, rowLength);
                     FilterType filterType = (FilterType)scanline[0];
                     byte[] defilteredScanline;
 
@@ -373,70 +451,30 @@ namespace ImageProcessorCore.Formats
                             throw new ImageFormatException("Unknown filter type.");
                     }
 
+                    int samples = (scanline.Length - 1) / sampleSize;
+                    for (int sample = 0; sample < samples; sample++)
+                    {
+                        for (int b = 0; b < sampleSize; b++)
+                        {
+                            int cf = interlaceColumnFrequency[i] * sampleSize;
+                            int co = interlaceColumnOffset[i] * sampleSize;
+                            int rf = interlaceRowFrequency[i];
+                            int ro = interlaceRowOffset[i];
+                            // TODO: Incorrect
+                            // defilteredScanline[((i * rf) + ro) + ((sample * cf) + co + b + 1)] = scanline[(sample * sampleSize) + b + 1];
+                        }
+                    }
+
                     previousScanline = defilteredScanline;
 
 
-                    Array.Copy(defilteredScanline, 0, defilteredPixelData, y * this.bytesPerScanline, this.bytesPerScanline);
+                    // Array.Copy(defilteredScanline, 0, deinterlacedPixelData, y * this.bytesPerScanline, this.bytesPerScanline);
                 }
+
+                subImageOffset = offset + rowLength;
             }
 
-            this.ProcessDefilteredScanlines<TColor, TPacked>(defilteredPixelData, pixels);
-
-            //byte[] previousScanline = new byte[this.bytesPerScanline];
-
-            //for (int y = 0; y < this.header.Height; y++)
-            //{
-            //    byte[] scanline = new byte[this.bytesPerScanline];
-            //    Array.Copy(pixelData, y * this.bytesPerScanline, scanline, 0, this.bytesPerScanline);
-            //    FilterType filterType = (FilterType)scanline[0];
-            //    byte[] defilteredScanline;
-
-            //    switch (filterType)
-            //    {
-            //        case FilterType.None:
-
-            //            defilteredScanline = NoneFilter.Decode(scanline);
-
-            //            break;
-
-            //        case FilterType.Sub:
-
-            //            defilteredScanline = SubFilter.Decode(scanline, this.bytesPerPixel);
-
-            //            break;
-
-            //        case FilterType.Up:
-
-            //            defilteredScanline = UpFilter.Decode(scanline, previousScanline);
-
-            //            break;
-
-            //        case FilterType.Average:
-
-            //            defilteredScanline = AverageFilter.Decode(scanline, previousScanline, this.bytesPerPixel);
-
-            //            break;
-
-            //        case FilterType.Paeth:
-
-            //            defilteredScanline = PaethFilter.Decode(scanline, previousScanline, this.bytesPerPixel);
-
-            //            break;
-
-            //        default:
-            //            throw new ImageFormatException("Unknown filter type.");
-            //    }
-
-            //    previousScanline = defilteredScanline;
-
-
-
-
-
-
-
-            //    this.ProcessDefilteredScanline<TColor, TPacked>(defilteredScanline, y, pixels);
-            //}
+            this.ProcessDefilteredScanlines<TColor, TPacked>(deinterlacedPixelData, pixels);
         }
 
         /// <summary>
@@ -445,7 +483,6 @@ namespace ImageProcessorCore.Formats
         /// <typeparam name="TColor">The pixel format.</typeparam>
         /// <typeparam name="TPacked">The packed format. <example>uint, long, float.</example></typeparam>
         /// <param name="defilteredScanlines">The de-filtered scanline</param>
-        /// <param name="row">The current image row.</param>
         /// <param name="pixels">The image pixels</param>
         private void ProcessDefilteredScanlines<TColor, TPacked>(byte[] defilteredScanlines, TColor[] pixels)
             where TColor : struct, IPackedVector<TPacked>
@@ -571,134 +608,134 @@ namespace ImageProcessorCore.Formats
             }
         }
 
-        ///// <summary>
-        ///// Processes the de-filtered scanline filling the image pixel data
-        ///// </summary>
-        ///// <typeparam name="TColor">The pixel format.</typeparam>
-        ///// <typeparam name="TPacked">The packed format. <example>uint, long, float.</example></typeparam>
-        ///// <param name="defilteredScanline">The de-filtered scanline</param>
-        ///// <param name="row">The current image row.</param>
-        ///// <param name="pixels">The image pixels</param>
-        //private void ProcessDefilteredScanline<TColor, TPacked>(byte[] defilteredScanline, int row, TColor[] pixels)
-        //    where TColor : struct, IPackedVector<TPacked>
-        //    where TPacked : struct
-        //{
-        //    switch (this.PngColorType)
-        //    {
-        //        case PngColorType.Grayscale:
+        /// <summary>
+        /// Processes the de-filtered scanline filling the image pixel data
+        /// </summary>
+        /// <typeparam name="TColor">The pixel format.</typeparam>
+        /// <typeparam name="TPacked">The packed format. <example>uint, long, float.</example></typeparam>
+        /// <param name="defilteredScanline">The de-filtered scanline</param>
+        /// <param name="row">The current image row.</param>
+        /// <param name="pixels">The image pixels</param>
+        private void ProcessDefilteredScanline<TColor, TPacked>(byte[] defilteredScanline, int row, TColor[] pixels)
+            where TColor : struct, IPackedVector<TPacked>
+            where TPacked : struct
+        {
+            switch (this.PngColorType)
+            {
+                case PngColorType.Grayscale:
 
-        //            for (int x = 0; x < this.header.Width; x++)
-        //            {
-        //                int offset = 1 + (x * this.bytesPerPixel);
+                    for (int x = 0; x < this.header.Width; x++)
+                    {
+                        int offset = 1 + (x * this.bytesPerPixel);
 
-        //                byte intensity = defilteredScanline[offset];
+                        byte intensity = defilteredScanline[offset];
 
-        //                TColor color = default(TColor);
-        //                color.PackFromVector4(new Vector4(intensity, intensity, intensity, 255) / 255F);
-        //                pixels[(row * this.header.Width) + x] = color;
-        //            }
+                        TColor color = default(TColor);
+                        color.PackFromVector4(new Vector4(intensity, intensity, intensity, 255) / 255F);
+                        pixels[(row * this.header.Width) + x] = color;
+                    }
 
-        //            break;
+                    break;
 
-        //        case PngColorType.GrayscaleWithAlpha:
+                case PngColorType.GrayscaleWithAlpha:
 
-        //            for (int x = 0; x < this.header.Width; x++)
-        //            {
-        //                int offset = 1 + (x * this.bytesPerPixel);
+                    for (int x = 0; x < this.header.Width; x++)
+                    {
+                        int offset = 1 + (x * this.bytesPerPixel);
 
-        //                byte intensity = defilteredScanline[offset];
-        //                byte alpha = defilteredScanline[offset + this.bytesPerSample];
+                        byte intensity = defilteredScanline[offset];
+                        byte alpha = defilteredScanline[offset + this.bytesPerSample];
 
-        //                TColor color = default(TColor);
-        //                color.PackFromVector4(new Vector4(intensity, intensity, intensity, alpha) / 255F);
-        //                pixels[(row * this.header.Width) + x] = color;
-        //            }
+                        TColor color = default(TColor);
+                        color.PackFromVector4(new Vector4(intensity, intensity, intensity, alpha) / 255F);
+                        pixels[(row * this.header.Width) + x] = color;
+                    }
 
-        //            break;
+                    break;
 
-        //        case PngColorType.Palette:
+                case PngColorType.Palette:
 
-        //            byte[] newScanline = defilteredScanline.ToArrayByBitsLength(this.header.BitDepth);
+                    byte[] newScanline = defilteredScanline.ToArrayByBitsLength(this.header.BitDepth);
 
-        //            if (this.paletteAlpha != null && this.paletteAlpha.Length > 0)
-        //            {
-        //                // If the alpha palette is not null and has one or more entries, this means, that the image contains an alpha
-        //                // channel and we should try to read it.
-        //                for (int i = 0; i < this.header.Width; i++)
-        //                {
-        //                    int index = newScanline[i];
-        //                    int offset = (row * this.header.Width) + i;
-        //                    int pixelOffset = index * 3;
+                    if (this.paletteAlpha != null && this.paletteAlpha.Length > 0)
+                    {
+                        // If the alpha palette is not null and has one or more entries, this means, that the image contains an alpha
+                        // channel and we should try to read it.
+                        for (int i = 0; i < this.header.Width; i++)
+                        {
+                            int index = newScanline[i];
+                            int offset = (row * this.header.Width) + i;
+                            int pixelOffset = index * 3;
 
-        //                    byte a = this.paletteAlpha.Length > index ? this.paletteAlpha[index] : (byte)255;
-        //                    TColor color = default(TColor);
-        //                    if (a > 0)
-        //                    {
-        //                        byte r = this.palette[pixelOffset];
-        //                        byte g = this.palette[pixelOffset + 1];
-        //                        byte b = this.palette[pixelOffset + 2];
-        //                        color.PackFromVector4(new Vector4(r, g, b, a) / 255F);
-        //                    }
+                            byte a = this.paletteAlpha.Length > index ? this.paletteAlpha[index] : (byte)255;
+                            TColor color = default(TColor);
+                            if (a > 0)
+                            {
+                                byte r = this.palette[pixelOffset];
+                                byte g = this.palette[pixelOffset + 1];
+                                byte b = this.palette[pixelOffset + 2];
+                                color.PackFromVector4(new Vector4(r, g, b, a) / 255F);
+                            }
 
-        //                    pixels[offset] = color;
-        //                }
-        //            }
-        //            else
-        //            {
-        //                for (int i = 0; i < this.header.Width; i++)
-        //                {
-        //                    int index = newScanline[i];
-        //                    int offset = (row * this.header.Width) + i;
-        //                    int pixelOffset = index * 3;
+                            pixels[offset] = color;
+                        }
+                    }
+                    else
+                    {
+                        for (int i = 0; i < this.header.Width; i++)
+                        {
+                            int index = newScanline[i];
+                            int offset = (row * this.header.Width) + i;
+                            int pixelOffset = index * 3;
 
-        //                    byte r = this.palette[pixelOffset];
-        //                    byte g = this.palette[pixelOffset + 1];
-        //                    byte b = this.palette[pixelOffset + 2];
+                            byte r = this.palette[pixelOffset];
+                            byte g = this.palette[pixelOffset + 1];
+                            byte b = this.palette[pixelOffset + 2];
 
-        //                    TColor color = default(TColor);
-        //                    color.PackFromVector4(new Vector4(r, g, b, 255) / 255F);
-        //                    pixels[offset] = color;
-        //                }
-        //            }
+                            TColor color = default(TColor);
+                            color.PackFromVector4(new Vector4(r, g, b, 255) / 255F);
+                            pixels[offset] = color;
+                        }
+                    }
 
-        //            break;
+                    break;
 
-        //        case PngColorType.Rgb:
+                case PngColorType.Rgb:
 
-        //            for (int x = 0; x < this.header.Width; x++)
-        //            {
-        //                int offset = 1 + (x * this.bytesPerPixel);
+                    for (int x = 0; x < this.header.Width; x++)
+                    {
+                        int offset = 1 + (x * this.bytesPerPixel);
 
-        //                byte r = defilteredScanline[offset];
-        //                byte g = defilteredScanline[offset + this.bytesPerSample];
-        //                byte b = defilteredScanline[offset + (2 * this.bytesPerSample)];
+                        byte r = defilteredScanline[offset];
+                        byte g = defilteredScanline[offset + this.bytesPerSample];
+                        byte b = defilteredScanline[offset + (2 * this.bytesPerSample)];
 
-        //                TColor color = default(TColor);
-        //                color.PackFromVector4(new Vector4(r, g, b, 255) / 255F);
-        //                pixels[(row * this.header.Width) + x] = color;
-        //            }
+                        TColor color = default(TColor);
+                        color.PackFromVector4(new Vector4(r, g, b, 255) / 255F);
+                        pixels[(row * this.header.Width) + x] = color;
+                    }
 
-        //            break;
+                    break;
 
-        //        case PngColorType.RgbWithAlpha:
+                case PngColorType.RgbWithAlpha:
 
-        //            for (int x = 0; x < this.header.Width; x++)
-        //            {
-        //                int offset = 1 + (x * this.bytesPerPixel);
+                    for (int x = 0; x < this.header.Width; x++)
+                    {
+                        int offset = 1 + (x * this.bytesPerPixel);
 
-        //                byte r = defilteredScanline[offset];
-        //                byte g = defilteredScanline[offset + this.bytesPerSample];
-        //                byte b = defilteredScanline[offset + (2 * this.bytesPerSample)];
-        //                byte a = defilteredScanline[offset + (3 * this.bytesPerSample)];
+                        byte r = defilteredScanline[offset];
+                        byte g = defilteredScanline[offset + this.bytesPerSample];
+                        byte b = defilteredScanline[offset + (2 * this.bytesPerSample)];
+                        byte a = defilteredScanline[offset + (3 * this.bytesPerSample)];
 
-        //                TColor color = default(TColor);
-        //                color.PackFromVector4(new Vector4(r, g, b, a) / 255F);
-        //                pixels[(row * this.header.Width) + x] = color;
-        //            }
+                        TColor color = default(TColor);
+                        color.PackFromVector4(new Vector4(r, g, b, a) / 255F);
+                        pixels[(row * this.header.Width) + x] = color;
+                    }
 
-        //            break;
-        //    }
-        //}
+                    break;
+            }
+        }
 
         /// <summary>
         /// Reads a text chunk containing image properties from the data.
