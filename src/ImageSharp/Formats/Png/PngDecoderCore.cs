@@ -21,13 +21,13 @@ namespace ImageSharp.Formats
         /// </summary>
         private static readonly Dictionary<int, byte[]> ColorTypes = new Dictionary<int, byte[]>();
 
-        private static int[] interlaceColumnFrequency = { 8, 8, 4, 4, 2, 2, 1 };
+        private static int[] startingRow = { 0, 0, 4, 0, 2, 0, 1 };
 
-        private static int[] interlaceColumnOffset = { 0, 4, 0, 2, 0, 1, 0 };
+        private static int[] startingCol = { 0, 4, 0, 2, 0, 1, 0 };
 
-        private static int[] interlaceRowFrequency = { 8, 8, 8, 4, 4, 2, 2 };
+        private static int[] rowIncrement = { 8, 8, 8, 4, 4, 2, 2 };
 
-        private static int[] interlaceRowOffset = { 0, 0, 4, 0, 2, 0, 1 };
+        private static int[] colIncrement = { 8, 8, 4, 4, 2, 2, 1 };
 
         /// <summary>
         /// The stream to decode from.
@@ -396,14 +396,16 @@ namespace ImageSharp.Formats
             where TPacked : struct
         {
             // TODO: This needs rewriting to use pointers.
+            // Suggested implementation from the spec:
+            // http://www.libpng.org/pub/png/spec/1.1/PNG-Decoders.html
             byte[] deinterlacedPixelData = new byte[this.bytesPerScanline * this.header.Height];
             int subImageOffset = 0;
             int sampleSize = this.bytesPerPixel; // Math.Max(1, this.header.BitDepth / 8D);
 
             for (int i = 0; i < 7; i++)
             {
-                int subImageRows = this.header.Height / interlaceRowFrequency[i];
-                int subImageColumns = this.header.Width / interlaceColumnFrequency[i];
+                int subImageRows = this.header.Height / rowIncrement[i];
+                int subImageColumns = this.header.Width / colIncrement[i];
                 int rowLength = (int)Math.Ceiling(subImageColumns * this.header.BitDepth / 8D) + 1;
                 byte[] previousScanline = new byte[rowLength];
                 int offset = 0;
@@ -456,12 +458,12 @@ namespace ImageSharp.Formats
                     {
                         for (int b = 0; b < sampleSize; b++)
                         {
-                            int cf = interlaceColumnFrequency[i] * sampleSize;
-                            int co = interlaceColumnOffset[i] * sampleSize;
-                            int rf = interlaceRowFrequency[i];
-                            int ro = interlaceRowOffset[i];
+                            int cf = colIncrement[i] * sampleSize;
+                            int co = startingCol[i] * sampleSize;
+                            int rf = rowIncrement[i];
+                            int ro = startingRow[i];
                             // TODO: Incorrect
-                            // defilteredScanline[((i * rf) + ro) + ((sample * cf) + co + b + 1)] = scanline[(sample * sampleSize) + b + 1];
+                             defilteredScanline[((i * rf) + ro) + ((sample * cf) + co + b + 1)] = scanline[(sample * sampleSize) + b + 1];
                         }
                     }
 
